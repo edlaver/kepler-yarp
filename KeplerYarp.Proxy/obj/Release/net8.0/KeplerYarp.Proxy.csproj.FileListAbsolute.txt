@@ -1,10 +1,3 @@
-D:\AI\kepler-yarp\KeplerYarp.Proxy\obj\Release\net8.0\KeplerYarp.Proxy.csproj.AssemblyReference.cache
-D:\AI\kepler-yarp\KeplerYarp.Proxy\obj\Release\net8.0\rpswa.dswa.cache.json
-D:\AI\kepler-yarp\KeplerYarp.Proxy\obj\Release\net8.0\KeplerYarp.Proxy.GeneratedMSBuildEditorConfig.editorconfig
-D:\AI\kepler-yarp\KeplerYarp.Proxy\obj\Release\net8.0\KeplerYarp.Proxy.AssemblyInfoInputs.cache
-D:\AI\kepler-yarp\KeplerYarp.Proxy\obj\Release\net8.0\KeplerYarp.Proxy.AssemblyInfo.cs
-D:\AI\kepler-yarp\KeplerYarp.Proxy\obj\Release\net8.0\KeplerYarp.Proxy.csproj.CoreCompileInputs.cache
-D:\AI\kepler-yarp\KeplerYarp.Proxy\obj\Release\net8.0\KeplerYarp.Proxy.MvcApplicationPartsAssemblyInfo.cache
 D:\AI\kepler-yarp\KeplerYarp.Proxy\bin\Release\net8.0\appsettings.json
 D:\AI\kepler-yarp\KeplerYarp.Proxy\bin\Release\net8.0\KeplerYarp.Proxy.staticwebassets.endpoints.json
 D:\AI\kepler-yarp\KeplerYarp.Proxy\bin\Release\net8.0\KeplerYarp.Proxy.exe
@@ -14,6 +7,14 @@ D:\AI\kepler-yarp\KeplerYarp.Proxy\bin\Release\net8.0\KeplerYarp.Proxy.dll
 D:\AI\kepler-yarp\KeplerYarp.Proxy\bin\Release\net8.0\KeplerYarp.Proxy.pdb
 D:\AI\kepler-yarp\KeplerYarp.Proxy\bin\Release\net8.0\System.IO.Hashing.dll
 D:\AI\kepler-yarp\KeplerYarp.Proxy\bin\Release\net8.0\Yarp.ReverseProxy.dll
+D:\AI\kepler-yarp\KeplerYarp.Proxy\obj\Release\net8.0\KeplerYarp.Proxy.csproj.AssemblyReference.cache
+D:\AI\kepler-yarp\KeplerYarp.Proxy\obj\Release\net8.0\rpswa.dswa.cache.json
+D:\AI\kepler-yarp\KeplerYarp.Proxy\obj\Release\net8.0\KeplerYarp.Proxy.GeneratedMSBuildEditorConfig.editorconfig
+D:\AI\kepler-yarp\KeplerYarp.Proxy\obj\Release\net8.0\KeplerYarp.Proxy.AssemblyInfoInputs.cache
+D:\AI\kepler-yarp\KeplerYarp.Proxy\obj\Release\net8.0\KeplerYarp.Proxy.AssemblyInfo.cs
+D:\AI\kepler-yarp\KeplerYarp.Proxy\obj\Release\net8.0\KeplerYarp.Proxy.csproj.CoreCompileInputs.cache
+D:\AI\kepler-yarp\KeplerYarp.Proxy\obj\Release\net8.0\KeplerYarp.Proxy.MvcApplicationPartsAssemblyInfo.cache
+D:\AI\kepler-yarp\KeplerYarp.Proxy\obj\Release\net8.0\KeplerYarp.Proxy.sourcelink.json
 D:\AI\kepler-yarp\KeplerYarp.Proxy\obj\Release\net8.0\rjimswa.dswa.cache.json
 D:\AI\kepler-yarp\KeplerYarp.Proxy\obj\Release\net8.0\rjsmrazor.dswa.cache.json
 D:\AI\kepler-yarp\KeplerYarp.Proxy\obj\Release\net8.0\rjsmcshtml.dswa.cache.json
