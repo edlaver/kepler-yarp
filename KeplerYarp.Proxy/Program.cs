@@ -1,7 +1,9 @@
 using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using Microsoft.Extensions.Options;
 using Yarp.ReverseProxy.Forwarder;
 using Yarp.ReverseProxy.Transforms;
@@ -49,6 +51,7 @@ internal sealed class ProviderOptions
     public string RoutePrefix { get; init; } = string.Empty;
     public string UpstreamTemplate { get; init; } = string.Empty;
     public string DefaultModel { get; init; } = string.Empty;
+    public Dictionary<string, string> ModelAliases { get; init; } = new(StringComparer.OrdinalIgnoreCase);
 }
 
 internal sealed class DynamicModelTransformProvider : ITransformProvider
@@ -88,7 +91,8 @@ internal sealed class DynamicModelTransformProvider : ITransformProvider
                 transformContext.ProxyRequest.Options.Set(TokenRefreshHandler.OriginalAuthKey, authHeader.ToString());
             }
 
-            var model = await TryGetModelAsync(transformContext.HttpContext.Request).ConfigureAwait(false);
+            var request = transformContext.HttpContext.Request;
+            var model = await TryGetModelAsync(request).ConfigureAwait(false);
             if (string.IsNullOrWhiteSpace(model))
             {
                 model = provider.DefaultModel;
@@ -97,6 +101,16 @@ internal sealed class DynamicModelTransformProvider : ITransformProvider
             if (string.IsNullOrWhiteSpace(model))
             {
                 return;
+            }
+
+            if (provider.ModelAliases.TryGetValue(model, out var aliasTarget) && !string.IsNullOrWhiteSpace(aliasTarget))
+            {
+                model = aliasTarget;
+                await TryUpdateModelAsync(request, model).ConfigureAwait(false);
+            }
+            else if (!string.IsNullOrWhiteSpace(provider.DefaultModel) && !string.Equals(model, provider.DefaultModel, StringComparison.Ordinal))
+            {
+                await TryUpdateModelAsync(request, model).ConfigureAwait(false);
             }
 
             transformContext.DestinationPrefix = provider.UpstreamTemplate.Replace("{model}", model, StringComparison.OrdinalIgnoreCase);
@@ -143,6 +157,54 @@ internal sealed class DynamicModelTransformProvider : ITransformProvider
         catch (JsonException)
         {
             return null;
+        }
+        finally
+        {
+            if (request.Body.CanSeek)
+            {
+                request.Body.Position = 0;
+            }
+        }
+    }
+
+    private static async Task TryUpdateModelAsync(HttpRequest request, string model)
+    {
+        if (request.ContentLength == 0)
+        {
+            return;
+        }
+
+        if (request.ContentType is null || !request.ContentType.Contains("application/json", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        request.EnableBuffering();
+
+        try
+        {
+            using var document = await JsonDocument.ParseAsync(request.Body).ConfigureAwait(false);
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                return;
+            }
+
+            var json = JsonNode.Parse(document.RootElement.GetRawText()) as JsonObject;
+            if (json is null)
+            {
+                return;
+            }
+
+            json["model"] = model;
+
+            var updated = json.ToJsonString();
+            var bytes = Encoding.UTF8.GetBytes(updated);
+            request.Body = new MemoryStream(bytes);
+            request.ContentLength = bytes.Length;
+            request.Body.Position = 0;
+        }
+        catch (JsonException)
+        {
         }
         finally
         {
