@@ -74,6 +74,22 @@ app.Use(async (context, next) =>
             updated = true;
         }
 
+        if (provider.StripProperties.Length > 0)
+        {
+            foreach (var property in provider.StripProperties)
+            {
+                if (string.IsNullOrWhiteSpace(property))
+                {
+                    continue;
+                }
+
+                if (json.Remove(property))
+                {
+                    updated = true;
+                }
+            }
+        }
+
         if (updated)
         {
             RequestJsonHelper.UpdateRequestJsonContent(request, json);
@@ -137,6 +153,7 @@ internal sealed class ProviderOptions
     public string DefaultModel { get; init; } = string.Empty;
     public Dictionary<string, string> ModelAliases { get; init; } = new(StringComparer.OrdinalIgnoreCase);
     public bool DisableStreaming { get; init; }
+    public string[] StripProperties { get; init; } = Array.Empty<string>();
 }
 
 internal sealed class DynamicModelTransformProvider : ITransformProvider
