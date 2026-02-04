@@ -96,7 +96,8 @@ internal sealed class DynamicModelTransformProvider : ITransformProvider
             }
 
             var request = transformContext.HttpContext.Request;
-            var model = await TryGetModelAsync(request).ConfigureAwait(false);
+            var json = await TryReadJsonObjectAsync(request).ConfigureAwait(false);
+            var model = TryGetModelFromJson(json);
             if (string.IsNullOrWhiteSpace(model))
             {
                 model = provider.DefaultModel;
@@ -110,16 +111,30 @@ internal sealed class DynamicModelTransformProvider : ITransformProvider
             if (provider.ModelAliases.TryGetValue(model, out var aliasTarget) && !string.IsNullOrWhiteSpace(aliasTarget))
             {
                 model = aliasTarget;
-                await TryUpdateModelAsync(request, model).ConfigureAwait(false);
-            }
-            else if (!string.IsNullOrWhiteSpace(provider.DefaultModel) && !string.Equals(model, provider.DefaultModel, StringComparison.Ordinal))
-            {
-                await TryUpdateModelAsync(request, model).ConfigureAwait(false);
             }
 
-            if (provider.DisableStreaming && request.Path.Value?.EndsWith("/chat/completions", StringComparison.OrdinalIgnoreCase) == true)
+            var shouldDisableStreaming = provider.DisableStreaming
+                && request.Path.Value?.EndsWith("/chat/completions", StringComparison.OrdinalIgnoreCase) == true;
+
+            if (json is not null)
             {
-                await TryUpdateStreamAsync(request).ConfigureAwait(false);
+                var updated = false;
+                if (!string.Equals(TryGetModelFromJson(json), model, StringComparison.Ordinal))
+                {
+                    json["model"] = model;
+                    updated = true;
+                }
+
+                if (shouldDisableStreaming)
+                {
+                    json["stream"] = false;
+                    updated = true;
+                }
+
+                if (updated)
+                {
+                    UpdateProxyJsonContent(transformContext.ProxyRequest, request, json);
+                }
             }
 
             transformContext.DestinationPrefix = provider.UpstreamTemplate.Replace("{model}", model, StringComparison.OrdinalIgnoreCase);
@@ -134,7 +149,7 @@ internal sealed class DynamicModelTransformProvider : ITransformProvider
     {
     }
 
-    private static async Task<string?> TryGetModelAsync(HttpRequest request)
+    private static async Task<JsonObject?> TryReadJsonObjectAsync(HttpRequest request)
     {
         if (request.ContentLength == 0)
         {
@@ -151,17 +166,12 @@ internal sealed class DynamicModelTransformProvider : ITransformProvider
         try
         {
             using var document = await JsonDocument.ParseAsync(request.Body).ConfigureAwait(false);
-            if (!document.RootElement.TryGetProperty("model", out var modelProperty))
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
             {
                 return null;
             }
 
-            if (modelProperty.ValueKind != JsonValueKind.String)
-            {
-                return null;
-            }
-
-            return modelProperty.GetString();
+            return JsonNode.Parse(document.RootElement.GetRawText()) as JsonObject;
         }
         catch (JsonException)
         {
@@ -176,99 +186,49 @@ internal sealed class DynamicModelTransformProvider : ITransformProvider
         }
     }
 
-    private static async Task TryUpdateModelAsync(HttpRequest request, string model)
+    private static string? TryGetModelFromJson(JsonObject? json)
     {
-        if (request.ContentLength == 0)
+        if (json is null)
         {
-            return;
+            return null;
         }
 
-        if (request.ContentType is null || !request.ContentType.Contains("application/json", StringComparison.OrdinalIgnoreCase))
+        if (json.TryGetPropertyValue("model", out var modelNode)
+            && modelNode is JsonValue modelValue
+            && modelValue.TryGetValue<string>(out var model))
         {
-            return;
+            return model;
         }
 
-        request.EnableBuffering();
-
-        try
-        {
-            using var document = await JsonDocument.ParseAsync(request.Body).ConfigureAwait(false);
-            if (document.RootElement.ValueKind != JsonValueKind.Object)
-            {
-                return;
-            }
-
-            var json = JsonNode.Parse(document.RootElement.GetRawText()) as JsonObject;
-            if (json is null)
-            {
-                return;
-            }
-
-            json["model"] = model;
-
-            var updated = json.ToJsonString();
-            var bytes = Encoding.UTF8.GetBytes(updated);
-            request.Body = new MemoryStream(bytes);
-            request.ContentLength = bytes.Length;
-            request.Body.Position = 0;
-        }
-        catch (JsonException)
-        {
-        }
-        finally
-        {
-            if (request.Body.CanSeek)
-            {
-                request.Body.Position = 0;
-            }
-        }
+        return null;
     }
 
-    private static async Task TryUpdateStreamAsync(HttpRequest request)
+    private static void UpdateProxyJsonContent(HttpRequestMessage proxyRequest, HttpRequest sourceRequest, JsonObject json)
     {
-        if (request.ContentLength == 0)
+        var payload = json.ToJsonString();
+        var bytes = Encoding.UTF8.GetBytes(payload);
+        var content = new ByteArrayContent(bytes);
+
+        if (MediaTypeHeaderValue.TryParse(sourceRequest.ContentType, out var contentType))
         {
-            return;
+            content.Headers.ContentType = contentType;
+        }
+        else
+        {
+            content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
         }
 
-        if (request.ContentType is null || !request.ContentType.Contains("application/json", StringComparison.OrdinalIgnoreCase))
+        CopyHeaderIfPresent(sourceRequest.Headers, content.Headers, "Content-Encoding");
+        CopyHeaderIfPresent(sourceRequest.Headers, content.Headers, "Content-Language");
+
+        proxyRequest.Content = content;
+    }
+
+    private static void CopyHeaderIfPresent(IHeaderDictionary source, HttpContentHeaders destination, string headerName)
+    {
+        if (source.TryGetValue(headerName, out var values))
         {
-            return;
-        }
-
-        request.EnableBuffering();
-
-        try
-        {
-            using var document = await JsonDocument.ParseAsync(request.Body).ConfigureAwait(false);
-            if (document.RootElement.ValueKind != JsonValueKind.Object)
-            {
-                return;
-            }
-
-            var json = JsonNode.Parse(document.RootElement.GetRawText()) as JsonObject;
-            if (json is null)
-            {
-                return;
-            }
-
-            json["stream"] = false;
-
-            var updated = json.ToJsonString();
-            var bytes = Encoding.UTF8.GetBytes(updated);
-            request.Body = new MemoryStream(bytes);
-            request.ContentLength = bytes.Length;
-            request.Body.Position = 0;
-        }
-        catch (JsonException)
-        {
-        }
-        finally
-        {
-            if (request.Body.CanSeek)
-            {
-                request.Body.Position = 0;
-            }
+            destination.TryAddWithoutValidation(headerName, (IEnumerable<string>)values);
         }
     }
 }
