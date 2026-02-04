@@ -70,6 +70,7 @@ app.Use(async (context, next) =>
         if (shouldDisableStreaming)
         {
             json["stream"] = false;
+            json.Remove("stream_options");
             updated = true;
         }
 
