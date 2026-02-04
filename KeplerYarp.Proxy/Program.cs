@@ -55,6 +55,7 @@ internal sealed class ProviderOptions
     public string UpstreamTemplate { get; init; } = string.Empty;
     public string DefaultModel { get; init; } = string.Empty;
     public Dictionary<string, string> ModelAliases { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+    public bool DisableStreaming { get; init; }
 }
 
 internal sealed class DynamicModelTransformProvider : ITransformProvider
@@ -114,6 +115,11 @@ internal sealed class DynamicModelTransformProvider : ITransformProvider
             else if (!string.IsNullOrWhiteSpace(provider.DefaultModel) && !string.Equals(model, provider.DefaultModel, StringComparison.Ordinal))
             {
                 await TryUpdateModelAsync(request, model).ConfigureAwait(false);
+            }
+
+            if (provider.DisableStreaming && request.Path.Value?.EndsWith("/chat/completions", StringComparison.OrdinalIgnoreCase) == true)
+            {
+                await TryUpdateStreamAsync(request).ConfigureAwait(false);
             }
 
             transformContext.DestinationPrefix = provider.UpstreamTemplate.Replace("{model}", model, StringComparison.OrdinalIgnoreCase);
@@ -199,6 +205,54 @@ internal sealed class DynamicModelTransformProvider : ITransformProvider
             }
 
             json["model"] = model;
+
+            var updated = json.ToJsonString();
+            var bytes = Encoding.UTF8.GetBytes(updated);
+            request.Body = new MemoryStream(bytes);
+            request.ContentLength = bytes.Length;
+            request.Body.Position = 0;
+        }
+        catch (JsonException)
+        {
+        }
+        finally
+        {
+            if (request.Body.CanSeek)
+            {
+                request.Body.Position = 0;
+            }
+        }
+    }
+
+    private static async Task TryUpdateStreamAsync(HttpRequest request)
+    {
+        if (request.ContentLength == 0)
+        {
+            return;
+        }
+
+        if (request.ContentType is null || !request.ContentType.Contains("application/json", StringComparison.OrdinalIgnoreCase))
+        {
+            return;
+        }
+
+        request.EnableBuffering();
+
+        try
+        {
+            using var document = await JsonDocument.ParseAsync(request.Body).ConfigureAwait(false);
+            if (document.RootElement.ValueKind != JsonValueKind.Object)
+            {
+                return;
+            }
+
+            var json = JsonNode.Parse(document.RootElement.GetRawText()) as JsonObject;
+            if (json is null)
+            {
+                return;
+            }
+
+            json["stream"] = false;
 
             var updated = json.ToJsonString();
             var bytes = Encoding.UTF8.GetBytes(updated);
