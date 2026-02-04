@@ -133,7 +133,7 @@ internal sealed class DynamicModelTransformProvider : ITransformProvider
 
                 if (updated)
                 {
-                    UpdateProxyJsonContent(transformContext.ProxyRequest, request, json);
+                    UpdateRequestJsonContent(request, json);
                 }
             }
 
@@ -203,33 +203,15 @@ internal sealed class DynamicModelTransformProvider : ITransformProvider
         return null;
     }
 
-    private static void UpdateProxyJsonContent(HttpRequestMessage proxyRequest, HttpRequest sourceRequest, JsonObject json)
+    private static void UpdateRequestJsonContent(HttpRequest request, JsonObject json)
     {
         var payload = json.ToJsonString();
         var bytes = Encoding.UTF8.GetBytes(payload);
-        var content = new ByteArrayContent(bytes);
-
-        if (MediaTypeHeaderValue.TryParse(sourceRequest.ContentType, out var contentType))
-        {
-            content.Headers.ContentType = contentType;
-        }
-        else
-        {
-            content.Headers.ContentType = new MediaTypeHeaderValue("application/json");
-        }
-
-        CopyHeaderIfPresent(sourceRequest.Headers, content.Headers, "Content-Encoding");
-        CopyHeaderIfPresent(sourceRequest.Headers, content.Headers, "Content-Language");
-
-        proxyRequest.Content = content;
-    }
-
-    private static void CopyHeaderIfPresent(IHeaderDictionary source, HttpContentHeaders destination, string headerName)
-    {
-        if (source.TryGetValue(headerName, out var values))
-        {
-            destination.TryAddWithoutValidation(headerName, (IEnumerable<string>)values);
-        }
+        request.Body = new MemoryStream(bytes);
+        request.ContentLength = bytes.Length;
+        request.Headers.ContentLength = bytes.Length;
+        request.Headers.Remove("Transfer-Encoding");
+        request.Body.Position = 0;
     }
 }
 
