@@ -21,6 +21,7 @@ builder.Services.Configure<ProxyOptions>(builder.Configuration.GetSection(ProxyO
 builder.Services.AddHttpClient(TokenService.HttpClientName);
 builder.Services.AddSingleton<TokenService>();
 builder.Services.AddSingleton<IForwarderHttpClientFactory, ProxyForwarderHttpClientFactory>();
+builder.Services.AddSingleton<DebugLogger>();
 
 builder.Services
     .AddReverseProxy()
@@ -42,6 +43,8 @@ internal sealed class ProxyOptions
     public bool ConvertToken { get; init; }
 
     public string TokenEndpoint { get; init; } = "https://nwgateway-appdev.kepler-prod.shared.banksvcs.net/token";
+
+    public string? DebugPath { get; init; }
 
     public Dictionary<string, ProviderOptions> Providers { get; init; } = new(StringComparer.OrdinalIgnoreCase);
 }
@@ -219,11 +222,13 @@ internal sealed class DynamicModelTransformProvider : ITransformProvider
 internal sealed class ProxyForwarderHttpClientFactory : IForwarderHttpClientFactory
 {
     private readonly TokenService _tokenService;
+    private readonly DebugLogger _debugLogger;
     private readonly IOptionsMonitor<ProxyOptions> _options;
 
-    public ProxyForwarderHttpClientFactory(TokenService tokenService, IOptionsMonitor<ProxyOptions> options)
+    public ProxyForwarderHttpClientFactory(TokenService tokenService, DebugLogger debugLogger, IOptionsMonitor<ProxyOptions> options)
     {
         _tokenService = tokenService;
+        _debugLogger = debugLogger;
         _options = options;
     }
 
@@ -236,7 +241,7 @@ internal sealed class ProxyForwarderHttpClientFactory : IForwarderHttpClientFact
             AutomaticDecompression = DecompressionMethods.None
         };
 
-        var tokenHandler = new TokenRefreshHandler(_tokenService, _options)
+        var tokenHandler = new TokenRefreshHandler(_tokenService, _debugLogger, _options)
         {
             InnerHandler = socketsHandler
         };
@@ -250,11 +255,13 @@ internal sealed class TokenRefreshHandler : DelegatingHandler
     internal static readonly HttpRequestOptionsKey<string> OriginalAuthKey = new("OriginalAuthorization");
 
     private readonly TokenService _tokenService;
+    private readonly DebugLogger _debugLogger;
     private readonly IOptionsMonitor<ProxyOptions> _options;
 
-    public TokenRefreshHandler(TokenService tokenService, IOptionsMonitor<ProxyOptions> options)
+    public TokenRefreshHandler(TokenService tokenService, DebugLogger debugLogger, IOptionsMonitor<ProxyOptions> options)
     {
         _tokenService = tokenService;
+        _debugLogger = debugLogger;
         _options = options;
     }
 
@@ -263,13 +270,19 @@ internal sealed class TokenRefreshHandler : DelegatingHandler
         var options = _options.CurrentValue;
         if (!options.ConvertToken)
         {
-            return await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
+            await _debugLogger.LogRequestAsync(request, cancellationToken).ConfigureAwait(false);
+            var responseMessage = await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
+            await _debugLogger.LogResponseAsync(request, responseMessage, cancellationToken).ConfigureAwait(false);
+            return responseMessage;
         }
 
         request.Options.TryGetValue(OriginalAuthKey, out var originalAuth);
         if (string.IsNullOrWhiteSpace(originalAuth))
         {
-            return await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
+            await _debugLogger.LogRequestAsync(request, cancellationToken).ConfigureAwait(false);
+            var responseMessage = await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
+            await _debugLogger.LogResponseAsync(request, responseMessage, cancellationToken).ConfigureAwait(false);
+            return responseMessage;
         }
 
         if (request.Content is not null)
@@ -279,17 +292,22 @@ internal sealed class TokenRefreshHandler : DelegatingHandler
 
         await ApplyTokenAsync(request, originalAuth, forceRefresh: false, cancellationToken).ConfigureAwait(false);
 
-        var response = await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
-        if (response.StatusCode != HttpStatusCode.Unauthorized && response.StatusCode != HttpStatusCode.Forbidden)
+        await _debugLogger.LogRequestAsync(request, cancellationToken).ConfigureAwait(false);
+        var forwardResponse = await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        await _debugLogger.LogResponseAsync(request, forwardResponse, cancellationToken).ConfigureAwait(false);
+        if (forwardResponse.StatusCode != HttpStatusCode.Unauthorized && forwardResponse.StatusCode != HttpStatusCode.Forbidden)
         {
-            return response;
+            return forwardResponse;
         }
 
-        response.Dispose();
+        forwardResponse.Dispose();
 
         await ApplyTokenAsync(request, originalAuth, forceRefresh: true, cancellationToken).ConfigureAwait(false);
 
-        return await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        await _debugLogger.LogRequestAsync(request, cancellationToken).ConfigureAwait(false);
+        var retryResponse = await base.SendAsync(request, cancellationToken).ConfigureAwait(false);
+        await _debugLogger.LogResponseAsync(request, retryResponse, cancellationToken).ConfigureAwait(false);
+        return retryResponse;
     }
 
     private async Task ApplyTokenAsync(HttpRequestMessage request, string originalAuth, bool forceRefresh, CancellationToken cancellationToken)
@@ -409,4 +427,148 @@ internal sealed class TokenService
     }
 
     private sealed record TokenCacheEntry(string Token, DateTimeOffset LastUpdated);
+}
+
+internal sealed class DebugLogger
+{
+    private static long _sequence;
+    private readonly IOptionsMonitor<ProxyOptions> _options;
+
+    public DebugLogger(IOptionsMonitor<ProxyOptions> options)
+    {
+        _options = options;
+    }
+
+    public Task LogRequestAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        => LogAsync(request, response: null, "request", cancellationToken);
+
+    public Task LogResponseAsync(HttpRequestMessage request, HttpResponseMessage response, CancellationToken cancellationToken)
+        => LogAsync(request, response, "response", cancellationToken);
+
+    private async Task LogAsync(HttpRequestMessage request, HttpResponseMessage? response, string suffix, CancellationToken cancellationToken)
+    {
+        var debugPath = _options.CurrentValue.DebugPath;
+        if (string.IsNullOrWhiteSpace(debugPath))
+        {
+            return;
+        }
+
+        Directory.CreateDirectory(debugPath);
+
+        var timestamp = DateTimeOffset.UtcNow.ToString("yyyyMMdd-HHmmss-fffffff");
+        var sequence = Interlocked.Increment(ref _sequence);
+        var fileName = $"{timestamp}-{sequence:D4}-{suffix}.md";
+        var filePath = Path.Combine(debugPath, fileName);
+
+        var builder = new StringBuilder();
+        if (suffix == "request")
+        {
+            builder.AppendLine("# Request");
+            builder.AppendLine();
+            builder.AppendLine($"**Method**: {request.Method}");
+            builder.AppendLine($"**Uri**: {request.RequestUri}");
+            builder.AppendLine();
+            AppendHeaders(builder, request.Headers, request.Content?.Headers);
+
+            var payloadBytes = await ReadContentBytesAsync(request.Content, cancellationToken).ConfigureAwait(false);
+            if (payloadBytes is not null)
+            {
+                ReplaceRequestContent(request, payloadBytes);
+                builder.AppendLine();
+                builder.AppendLine("```json");
+                builder.AppendLine(Encoding.UTF8.GetString(payloadBytes));
+                builder.AppendLine("```");
+            }
+        }
+        else
+        {
+            builder.AppendLine("# Response");
+            builder.AppendLine();
+            builder.AppendLine($"**Status**: {(int)response!.StatusCode} {response.StatusCode}");
+            builder.AppendLine($"**Uri**: {request.RequestUri}");
+            builder.AppendLine();
+            AppendHeaders(builder, response.Headers, response.Content?.Headers);
+
+            var payloadBytes = await ReadContentBytesAsync(response.Content, cancellationToken).ConfigureAwait(false);
+            if (payloadBytes is not null)
+            {
+                ReplaceResponseContent(response, payloadBytes);
+                builder.AppendLine();
+                builder.AppendLine("```json");
+                builder.AppendLine(Encoding.UTF8.GetString(payloadBytes));
+                builder.AppendLine("```");
+            }
+        }
+
+        await File.WriteAllTextAsync(filePath, builder.ToString(), Encoding.UTF8, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static void AppendHeaders(StringBuilder builder, HttpHeaders headers, HttpHeaders? contentHeaders)
+    {
+        builder.AppendLine("| Header | Value |");
+        builder.AppendLine("| --- | --- |");
+        foreach (var header in headers)
+        {
+            builder.AppendLine($"| {header.Key} | {string.Join(", ", header.Value)} |");
+        }
+
+        if (contentHeaders is null)
+        {
+            return;
+        }
+
+        foreach (var header in contentHeaders)
+        {
+            builder.AppendLine($"| {header.Key} | {string.Join(", ", header.Value)} |");
+        }
+    }
+
+    private static async Task<byte[]?> ReadContentBytesAsync(HttpContent? content, CancellationToken cancellationToken)
+    {
+        if (content is null)
+        {
+            return null;
+        }
+
+        var bytes = await content.ReadAsByteArrayAsync(cancellationToken).ConfigureAwait(false);
+        if (bytes.Length == 0)
+        {
+            return null;
+        }
+        return bytes;
+    }
+
+    private static void ReplaceRequestContent(HttpRequestMessage request, byte[] bytes)
+    {
+        if (request.Content is null)
+        {
+            return;
+        }
+
+        var originalHeaders = request.Content.Headers;
+        var replacement = new ByteArrayContent(bytes);
+        foreach (var header in originalHeaders)
+        {
+            replacement.Headers.TryAddWithoutValidation(header.Key, header.Value);
+        }
+
+        request.Content = replacement;
+    }
+
+    private static void ReplaceResponseContent(HttpResponseMessage response, byte[] bytes)
+    {
+        if (response.Content is null)
+        {
+            return;
+        }
+
+        var originalHeaders = response.Content.Headers;
+        var replacement = new ByteArrayContent(bytes);
+        foreach (var header in originalHeaders)
+        {
+            replacement.Headers.TryAddWithoutValidation(header.Key, header.Value);
+        }
+
+        response.Content = replacement;
+    }
 }
