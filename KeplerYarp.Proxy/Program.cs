@@ -32,9 +32,89 @@ builder.WebHost.UseUrls("http://localhost:4000");
 
 var app = builder.Build();
 
+app.Use(async (context, next) =>
+{
+    var options = context.RequestServices.GetRequiredService<IOptionsMonitor<ProxyOptions>>().CurrentValue;
+    var provider = ResolveProvider(options, context.Request.Path);
+    if (provider is null)
+    {
+        await next().ConfigureAwait(false);
+        return;
+    }
+
+    var request = context.Request;
+    var json = await RequestJsonHelper.TryReadJsonObjectAsync(request).ConfigureAwait(false);
+    var model = RequestJsonHelper.TryGetModelFromJson(json);
+    if (string.IsNullOrWhiteSpace(model))
+    {
+        model = provider.DefaultModel;
+    }
+
+    if (!string.IsNullOrWhiteSpace(model) && provider.ModelAliases.TryGetValue(model, out var aliasTarget) && !string.IsNullOrWhiteSpace(aliasTarget))
+    {
+        model = aliasTarget;
+    }
+
+    var shouldDisableStreaming = provider.DisableStreaming
+        && request.Path.Value?.EndsWith("/chat/completions", StringComparison.OrdinalIgnoreCase) == true;
+
+    if (json is not null)
+    {
+        var updated = false;
+        if (!string.IsNullOrWhiteSpace(model) && !string.Equals(RequestJsonHelper.TryGetModelFromJson(json), model, StringComparison.Ordinal))
+        {
+            json["model"] = model;
+            updated = true;
+        }
+
+        if (shouldDisableStreaming)
+        {
+            json["stream"] = false;
+            updated = true;
+        }
+
+        if (updated)
+        {
+            RequestJsonHelper.UpdateRequestJsonContent(request, json);
+        }
+    }
+
+    if (!string.IsNullOrWhiteSpace(model))
+    {
+        context.Items[DynamicModelTransformProvider.ResolvedModelKey] = model;
+    }
+
+    await next().ConfigureAwait(false);
+});
+
 app.MapReverseProxy();
 
 app.Run();
+
+static ProviderOptions? ResolveProvider(ProxyOptions options, PathString path)
+{
+    ProviderOptions? match = null;
+    var longest = 0;
+    foreach (var provider in options.Providers.Values)
+    {
+        if (string.IsNullOrWhiteSpace(provider.RoutePrefix))
+        {
+            continue;
+        }
+
+        if (path.StartsWithSegments(provider.RoutePrefix, StringComparison.OrdinalIgnoreCase))
+        {
+            var length = provider.RoutePrefix.Length;
+            if (length > longest)
+            {
+                longest = length;
+                match = provider;
+            }
+        }
+    }
+
+    return match;
+}
 
 internal sealed class ProxyOptions
 {
@@ -61,6 +141,7 @@ internal sealed class ProviderOptions
 internal sealed class DynamicModelTransformProvider : ITransformProvider
 {
     private const string OpenAiProviderKey = "openai";
+    internal const string ResolvedModelKey = "ResolvedModel";
 
     private readonly IOptionsMonitor<ProxyOptions> _options;
 
@@ -88,16 +169,17 @@ internal sealed class DynamicModelTransformProvider : ITransformProvider
         }
 
         context.AddPathRemovePrefix(provider.RoutePrefix);
-        context.AddRequestTransform(async transformContext =>
+        context.AddRequestTransform(transformContext =>
         {
             if (transformContext.HttpContext.Request.Headers.TryGetValue("Authorization", out var authHeader))
             {
                 transformContext.ProxyRequest.Options.Set(TokenRefreshHandler.OriginalAuthKey, authHeader.ToString());
             }
 
-            var request = transformContext.HttpContext.Request;
-            var json = await TryReadJsonObjectAsync(request).ConfigureAwait(false);
-            var model = TryGetModelFromJson(json);
+            var model = transformContext.HttpContext.Items.TryGetValue(ResolvedModelKey, out var value)
+                ? value as string
+                : null;
+
             if (string.IsNullOrWhiteSpace(model))
             {
                 model = provider.DefaultModel;
@@ -105,39 +187,11 @@ internal sealed class DynamicModelTransformProvider : ITransformProvider
 
             if (string.IsNullOrWhiteSpace(model))
             {
-                return;
-            }
-
-            if (provider.ModelAliases.TryGetValue(model, out var aliasTarget) && !string.IsNullOrWhiteSpace(aliasTarget))
-            {
-                model = aliasTarget;
-            }
-
-            var shouldDisableStreaming = provider.DisableStreaming
-                && request.Path.Value?.EndsWith("/chat/completions", StringComparison.OrdinalIgnoreCase) == true;
-
-            if (json is not null)
-            {
-                var updated = false;
-                if (!string.Equals(TryGetModelFromJson(json), model, StringComparison.Ordinal))
-                {
-                    json["model"] = model;
-                    updated = true;
-                }
-
-                if (shouldDisableStreaming)
-                {
-                    json["stream"] = false;
-                    updated = true;
-                }
-
-                if (updated)
-                {
-                    UpdateRequestJsonContent(request, json);
-                }
+                return ValueTask.CompletedTask;
             }
 
             transformContext.DestinationPrefix = provider.UpstreamTemplate.Replace("{model}", model, StringComparison.OrdinalIgnoreCase);
+            return ValueTask.CompletedTask;
         });
     }
 
@@ -149,7 +203,11 @@ internal sealed class DynamicModelTransformProvider : ITransformProvider
     {
     }
 
-    private static async Task<JsonObject?> TryReadJsonObjectAsync(HttpRequest request)
+}
+
+internal static class RequestJsonHelper
+{
+    public static async Task<JsonObject?> TryReadJsonObjectAsync(HttpRequest request)
     {
         if (request.ContentLength == 0)
         {
@@ -186,7 +244,7 @@ internal sealed class DynamicModelTransformProvider : ITransformProvider
         }
     }
 
-    private static string? TryGetModelFromJson(JsonObject? json)
+    public static string? TryGetModelFromJson(JsonObject? json)
     {
         if (json is null)
         {
@@ -203,7 +261,7 @@ internal sealed class DynamicModelTransformProvider : ITransformProvider
         return null;
     }
 
-    private static void UpdateRequestJsonContent(HttpRequest request, JsonObject json)
+    public static void UpdateRequestJsonContent(HttpRequest request, JsonObject json)
     {
         var payload = json.ToJsonString();
         var bytes = Encoding.UTF8.GetBytes(payload);
