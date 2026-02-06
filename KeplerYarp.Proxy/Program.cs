@@ -5,9 +5,11 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Microsoft.Extensions.Options;
+using Tiktoken;
 using Yarp.ReverseProxy.Forwarder;
 using Yarp.ReverseProxy.Transforms;
 using Yarp.ReverseProxy.Transforms.Builder;
+using TiktokenEncoder = Tiktoken.Encoder;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -22,6 +24,9 @@ builder.Services.AddHttpClient(TokenService.HttpClientName);
 builder.Services.AddSingleton<TokenService>();
 builder.Services.AddSingleton<IForwarderHttpClientFactory, ProxyForwarderHttpClientFactory>();
 builder.Services.AddSingleton<DebugLogger>();
+builder.Services.AddSingleton(new TiktokenEncoder(new Tiktoken.Encodings.O200KBase()));
+builder.Services.AddSingleton<TokenCounter>();
+builder.Services.AddSingleton<TokenRateLimiter>();
 
 builder.Services
     .AddReverseProxy()
@@ -43,21 +48,25 @@ app.Use(async (context, next) =>
     }
 
     var request = context.Request;
-    var json = await RequestJsonHelper.TryReadJsonObjectAsync(request).ConfigureAwait(false);
+    var payload = await RequestJsonHelper.TryReadJsonPayloadAsync(request).ConfigureAwait(false);
+    var json = payload?.Json;
     var model = RequestJsonHelper.TryGetModelFromJson(json);
     if (string.IsNullOrWhiteSpace(model))
     {
-        model = provider.DefaultModel;
+        model = provider.Value.Options.DefaultModel;
     }
 
-    if (!string.IsNullOrWhiteSpace(model) && provider.ModelAliases.TryGetValue(model, out var aliasTarget) && !string.IsNullOrWhiteSpace(aliasTarget))
+    if (!string.IsNullOrWhiteSpace(model)
+        && provider.Value.Options.ModelAliases.TryGetValue(model, out var aliasTarget)
+        && !string.IsNullOrWhiteSpace(aliasTarget))
     {
         model = aliasTarget;
     }
 
-    var shouldDisableStreaming = provider.DisableStreaming
+    var shouldDisableStreaming = provider.Value.Options.DisableStreaming
         && request.Path.Value?.EndsWith("/chat/completions", StringComparison.OrdinalIgnoreCase) == true;
 
+    var updatedPayload = payload?.RawText;
     if (json is not null)
     {
         var updated = false;
@@ -74,9 +83,9 @@ app.Use(async (context, next) =>
             updated = true;
         }
 
-        if (provider.StripProperties.Length > 0)
+        if (provider.Value.Options.StripProperties.Length > 0)
         {
-            foreach (var property in provider.StripProperties)
+            foreach (var property in provider.Value.Options.StripProperties)
             {
                 if (string.IsNullOrWhiteSpace(property))
                 {
@@ -92,13 +101,22 @@ app.Use(async (context, next) =>
 
         if (updated)
         {
-            RequestJsonHelper.UpdateRequestJsonContent(request, json);
+            updatedPayload = RequestJsonHelper.UpdateRequestJsonContent(request, json);
         }
     }
 
     if (!string.IsNullOrWhiteSpace(model))
     {
         context.Items[DynamicModelTransformProvider.ResolvedModelKey] = model;
+    }
+
+    if (provider.Value.Options.TokenLimitPerMinute > 0 && !string.IsNullOrWhiteSpace(updatedPayload))
+    {
+        var tokenCounter = context.RequestServices.GetRequiredService<TokenCounter>();
+        var limiter = context.RequestServices.GetRequiredService<TokenRateLimiter>();
+        var tokenCount = tokenCounter.CountTokens(updatedPayload);
+        await limiter.WaitForTokensAsync(provider.Value.Name, provider.Value.Options.TokenLimitPerMinute, tokenCount, context.RequestAborted)
+            .ConfigureAwait(false);
     }
 
     await next().ConfigureAwait(false);
@@ -108,12 +126,13 @@ app.MapReverseProxy();
 
 app.Run();
 
-static ProviderOptions? ResolveProvider(ProxyOptions options, PathString path)
+static ProviderRegistration? ResolveProvider(ProxyOptions options, PathString path)
 {
-    ProviderOptions? match = null;
+    ProviderRegistration? match = null;
     var longest = 0;
-    foreach (var provider in options.Providers.Values)
+    foreach (var entry in options.Providers)
     {
+        var provider = entry.Value;
         if (string.IsNullOrWhiteSpace(provider.RoutePrefix))
         {
             continue;
@@ -125,13 +144,15 @@ static ProviderOptions? ResolveProvider(ProxyOptions options, PathString path)
             if (length > longest)
             {
                 longest = length;
-                match = provider;
+                match = new ProviderRegistration(entry.Key, provider);
             }
         }
     }
 
     return match;
 }
+
+internal readonly record struct ProviderRegistration(string Name, ProviderOptions Options);
 
 internal sealed class ProxyOptions
 {
@@ -154,6 +175,7 @@ internal sealed class ProviderOptions
     public Dictionary<string, string> ModelAliases { get; init; } = new(StringComparer.OrdinalIgnoreCase);
     public bool DisableStreaming { get; init; }
     public string[] StripProperties { get; init; } = Array.Empty<string>();
+    public int TokenLimitPerMinute { get; init; }
 }
 
 internal sealed class DynamicModelTransformProvider : ITransformProvider
@@ -225,7 +247,7 @@ internal sealed class DynamicModelTransformProvider : ITransformProvider
 
 internal static class RequestJsonHelper
 {
-    public static async Task<JsonObject?> TryReadJsonObjectAsync(HttpRequest request)
+    public static async Task<JsonPayload?> TryReadJsonPayloadAsync(HttpRequest request)
     {
         if (request.ContentLength == 0)
         {
@@ -247,7 +269,9 @@ internal static class RequestJsonHelper
                 return null;
             }
 
-            return JsonNode.Parse(document.RootElement.GetRawText()) as JsonObject;
+            var rawText = document.RootElement.GetRawText();
+            var json = JsonNode.Parse(rawText) as JsonObject;
+            return json is null ? null : new JsonPayload(json, rawText);
         }
         catch (JsonException)
         {
@@ -279,7 +303,7 @@ internal static class RequestJsonHelper
         return null;
     }
 
-    public static void UpdateRequestJsonContent(HttpRequest request, JsonObject json)
+    public static string UpdateRequestJsonContent(HttpRequest request, JsonObject json)
     {
         var payload = json.ToJsonString();
         var bytes = Encoding.UTF8.GetBytes(payload);
@@ -288,6 +312,93 @@ internal static class RequestJsonHelper
         request.Headers.ContentLength = bytes.Length;
         request.Headers.Remove("Transfer-Encoding");
         request.Body.Position = 0;
+        return payload;
+    }
+}
+
+internal readonly record struct JsonPayload(JsonObject Json, string RawText);
+
+internal sealed class TokenCounter
+{
+    private readonly TiktokenEncoder _encoder;
+
+    public TokenCounter(TiktokenEncoder encoder)
+    {
+        _encoder = encoder;
+    }
+
+    public int CountTokens(string text) => _encoder.CountTokens(text);
+}
+
+internal sealed class TokenRateLimiter
+{
+    private readonly ConcurrentDictionary<string, Bucket> _buckets = new(StringComparer.OrdinalIgnoreCase);
+
+    public async Task WaitForTokensAsync(string key, int limitPerMinute, int tokens, CancellationToken cancellationToken)
+    {
+        if (limitPerMinute <= 0 || tokens <= 0)
+        {
+            return;
+        }
+
+        if (tokens > limitPerMinute)
+        {
+            return;
+        }
+
+        var bucket = _buckets.GetOrAdd(key, _ => new Bucket(limitPerMinute));
+
+        while (true)
+        {
+            TimeSpan delay;
+            lock (bucket.Sync)
+            {
+                bucket.Refill();
+                if (bucket.Available >= tokens)
+                {
+                    bucket.Available -= tokens;
+                    return;
+                }
+
+                var deficit = tokens - bucket.Available;
+                var seconds = deficit / bucket.RefillRate;
+                delay = TimeSpan.FromSeconds(Math.Max(0.01, seconds));
+            }
+
+            await Task.Delay(delay, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private sealed class Bucket
+    {
+        private readonly int _capacity;
+        private DateTimeOffset _lastRefill;
+
+        public Bucket(int capacity)
+        {
+            _capacity = capacity;
+            Available = capacity;
+            RefillRate = capacity / 60d;
+            _lastRefill = DateTimeOffset.UtcNow;
+            Sync = new object();
+        }
+
+        public object Sync { get; }
+        public double Available { get; set; }
+        public double RefillRate { get; }
+
+        public void Refill()
+        {
+            var now = DateTimeOffset.UtcNow;
+            var elapsedSeconds = (now - _lastRefill).TotalSeconds;
+            if (elapsedSeconds <= 0)
+            {
+                return;
+            }
+
+            Available = Math.Min(_capacity, Available + elapsedSeconds * RefillRate);
+            _lastRefill = now;
+        }
     }
 }
 
