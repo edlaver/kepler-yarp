@@ -659,7 +659,7 @@ internal sealed class DebugLogger
                 ReplaceRequestContent(request, payloadBytes);
                 builder.AppendLine();
                 builder.AppendLine("```json");
-                builder.AppendLine(Encoding.UTF8.GetString(payloadBytes));
+                builder.AppendLine(PrettyPrintJson(payloadBytes));
                 builder.AppendLine("```");
             }
         }
@@ -678,7 +678,7 @@ internal sealed class DebugLogger
                 ReplaceResponseContent(response, payloadBytes);
                 builder.AppendLine();
                 builder.AppendLine("```json");
-                builder.AppendLine(Encoding.UTF8.GetString(payloadBytes));
+                builder.AppendLine(PrettyPrintJson(payloadBytes));
                 builder.AppendLine("```");
             }
         }
@@ -719,6 +719,22 @@ internal sealed class DebugLogger
             return null;
         }
         return bytes;
+    }
+
+    private static string PrettyPrintJson(byte[] payloadBytes)
+    {
+        try
+        {
+            using var document = JsonDocument.Parse(payloadBytes);
+            return JsonSerializer.Serialize(document.RootElement, new JsonSerializerOptions
+            {
+                WriteIndented = true
+            });
+        }
+        catch (JsonException)
+        {
+            return Encoding.UTF8.GetString(payloadBytes);
+        }
     }
 
     private static void ReplaceRequestContent(HttpRequestMessage request, byte[] bytes)
